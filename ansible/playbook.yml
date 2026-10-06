@@ -38,6 +38,12 @@
           net.ipv4.tcp_fastopen = 3
           net.core.somaxconn = 4096
 
+    - name: Ensure journald config directory exists
+      file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        mode: '0755'
+
     - name: Cap systemd journal to 50MB
       copy:
         dest: /etc/systemd/journald.conf.d/size.conf
@@ -66,6 +72,8 @@
 
     - name: Install OpenChamber and Wrangler via Bun
       become_user: "{{ devbox_user }}"
+      environment:
+        HOME: "/home/{{ devbox_user }}"
       shell: |
         /usr/local/bin/bun add -g @openchamber/web@latest wrangler@latest @caveman-ai/cli@latest
       args:
@@ -165,7 +173,7 @@
                   }
               }
           }
-      notify: Reload caddy
+      notify: Restart caddy
 
   handlers:
     - name: Restart zram
@@ -173,13 +181,15 @@
         name: systemd-zram-setup@zram0.service
         state: restarted
         daemon_reload: yes
+      failed_when: false
 
     - name: Restart journald
       systemd:
         name: systemd-journald
         state: restarted
 
-    - name: Reload caddy
+    - name: Restart caddy
       systemd:
         name: caddy
-        state: reloaded
+        state: restarted
+        enabled: yes
