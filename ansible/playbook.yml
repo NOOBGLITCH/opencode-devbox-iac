@@ -105,6 +105,46 @@
         name: "user@1000.service"
         state: started
 
+    # ── Phase 4.5: Workspace & Project Initialization ──────────
+    - name: Ensure workspace and OpenChamber config directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ devbox_user }}"
+        group: "{{ devbox_user }}"
+        mode: '0755'
+      loop:
+        - "/home/{{ devbox_user }}/workspace"
+        - "/home/{{ devbox_user }}/.config/openchamber"
+
+    - name: Initialize git in workspace directory
+      command: git init /home/{{ devbox_user }}/workspace
+      become_user: "{{ devbox_user }}"
+      args:
+        creates: "/home/{{ devbox_user }}/workspace/.git"
+
+    - name: Pre-seed OpenChamber settings with active workspace project
+      copy:
+        dest: "/home/{{ devbox_user }}/.config/openchamber/settings.json"
+        owner: "{{ devbox_user }}"
+        group: "{{ devbox_user }}"
+        mode: '0644'
+        force: no
+        content: |
+          {
+            "projects": [
+              {
+                "id": "path_L2hvbWUvdWJ1bnR1L3dvcmtzcGFjZQ",
+                "name": "workspace",
+                "path": "/home/{{ devbox_user }}/workspace",
+                "addedAt": 1700000000000,
+                "lastOpenedAt": 1700000000000
+              }
+            ],
+            "activeProjectId": "path_L2hvbWUvdWJ1bnR1L3dvcmtzcGFjZQ",
+            "lastDirectory": "/home/{{ devbox_user }}/workspace"
+          }
+
     # ── Phase 5: Systemd User Service ──────────────────────────
     - name: Ensure user systemd directory exists
       file:
@@ -126,7 +166,7 @@
 
           [Service]
           Type=simple
-          WorkingDirectory=/home/{{ devbox_user }}
+          WorkingDirectory=/home/{{ devbox_user }}/workspace
           Environment=HOME=/home/{{ devbox_user }}
           Environment=NODE_ENV=production
           Environment=NODE_OPTIONS=--max-old-space-size=2048
