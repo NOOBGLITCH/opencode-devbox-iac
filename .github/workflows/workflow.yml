@@ -1,0 +1,69 @@
+name: Deploy OpenChamber Devbox
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Terraform/**'
+      - 'ansible/**'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # ── 1. AWS Credentials & Terraform Setup ──
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ap-south-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      # ── 2. Run Terraform (c7i-flex.large on ap-south-1) ──
+      - name: Terraform Apply
+        id: tf
+        run: |
+          cd Terraform
+          terraform init
+          terraform apply -auto-approve
+          echo "EC2_IP=$(terraform output -raw ec2_public_ip)" >> $GITHUB_OUTPUT
+
+      # ── 3. Wait for EC2 SSH Readiness Gate ──
+      - name: Wait for SSH
+        run: |
+          echo "Waiting for EC2 SSH on ${{ steps.tf.outputs.EC2_IP }}..."
+          until nc -z -v -w5 ${{ steps.tf.outputs.EC2_IP }} 22; do
+            sleep 5
+          done
+          echo "SSH daemon is reachable!"
+
+      # ── 4. Setup SSH Key for Ansible ──
+      - name: Setup SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ steps.tf.outputs.EC2_IP }} >> ~/.ssh/known_hosts
+
+      # ── 5. Run Ansible Playbook ──
+      - name: Run Ansible Playbook
+        run: |
+          DOMAIN_NAME="$(echo "${{ steps.tf.outputs.EC2_IP }}" | tr '.' '-').sslip.io"
+          ansible-playbook -i "${{ steps.tf.outputs.EC2_IP }}," \
+            -u ubuntu \
+            --private-key ~/.ssh/id_rsa \
+            --extra-vars "domain_name=${DOMAIN_NAME} openchamber_password=${{ secrets.OPENCHAMBER_PASSWORD }}" \
+            ansible/playbook.yml
+
+      # ── 6. Output Access URL ──
+      - name: Deployment Success
+        run: |
+          DOMAIN_NAME="$(echo "${{ steps.tf.outputs.EC2_IP }}" | tr '.' '-').sslip.io"
+          echo "Devbox ready at: https://${DOMAIN_NAME}"

@@ -1,0 +1,185 @@
+---
+- name: Setup Lean OpenChamber + OpenCode Devbox on c7i-flex.large
+  hosts: devbox
+  become: true
+  vars:
+    devbox_user: "ubuntu"
+    openchamber_port: 8080
+    openchamber_password: "{{ lookup('env', 'OPENCHAMBER_PASSWORD') | default('OC-workspace-2026!', true) }}"
+    domain_name: "{{ ansible_host | replace('.', '-') }}.sslip.io"
+
+  tasks:
+    # ── Phase 1: Kernel & Memory Tuning (zRAM + BBR for 4GB RAM) ───
+    - name: Install systemd-zram-generator & essential utils
+      apt:
+        name: [systemd-zram-generator, curl, unzip, git, procps, util-linux]
+        state: present
+        update_cache: yes
+
+    - name: Configure zRAM (zstd, 1x RAM = 4GB compressed swap)
+      copy:
+        dest: /etc/systemd/zram-generator.conf
+        content: |
+          [zram0]
+          zram-size = ram
+          compression-algorithm = zstd
+          swap-priority = 100
+      notify: Restart zram
+
+    - name: Apply BBR and sysctl memory tunings
+      copy:
+        dest: /etc/sysctl.d/99-devbox-perf.conf
+        content: |
+          vm.swappiness = 150
+          vm.vfs_cache_pressure = 50
+          vm.page-cluster = 0
+          net.core.default_qdisc = fq
+          net.ipv4.tcp_congestion_control = bbr
+          net.ipv4.tcp_fastopen = 3
+          net.core.somaxconn = 4096
+
+    - name: Cap systemd journal to 50MB
+      copy:
+        dest: /etc/systemd/journald.conf.d/size.conf
+        content: |
+          [Journal]
+          SystemMaxUse=50M
+      notify: Restart journald
+
+    # ── Phase 2: Runtime (Bun) ──────────────────────────────────
+    - name: Install Bun binary
+      shell: |
+        curl -fsSL https://bun.sh/install | bash
+        cp /root/.bun/bin/bun /usr/local/bin/bun
+        ln -sf /usr/local/bin/bun /usr/local/bin/bunx
+        ln -sf /usr/local/bin/bun /usr/local/bin/node
+      args:
+        creates: /usr/local/bin/bun
+
+    # ── Phase 3: Install OpenCode v2, OpenChamber, Wrangler ─────
+    - name: Install OpenCode native binary (always latest)
+      shell: |
+        curl -fsSL https://opencode.ai/v2/install | bash -s -- --no-modify-path
+        cp /root/.opencode/bin/opencode /usr/local/bin/opencode
+      args:
+        creates: /usr/local/bin/opencode
+
+    - name: Install OpenChamber and Wrangler via Bun
+      become_user: "{{ devbox_user }}"
+      shell: |
+        /usr/local/bin/bun add -g @openchamber/web@latest wrangler@latest @caveman-ai/cli@latest
+      args:
+        creates: "/home/{{ devbox_user }}/.bun/bin/openchamber"
+
+    - name: Symlink tools to /usr/local/bin
+      file:
+        src: "/home/{{ devbox_user }}/.bun/bin/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        state: link
+      loop: [openchamber, wrangler, caveman, cave]
+
+    # ── Phase 4: User Session & DBus Environment ───────────────
+    - name: Add user bus session variables to /etc/profile.d
+      copy:
+        dest: /etc/profile.d/99-systemd-user-bus.sh
+        content: |
+          if [ -n "$UID" ] && [ -d "/run/user/$UID" ]; then
+              export XDG_RUNTIME_DIR="/run/user/$UID"
+              export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID/bus"
+          fi
+
+    - name: Enable user linger for 24/7 background execution
+      command: "loginctl enable-linger {{ devbox_user }}"
+      changed_when: false
+
+    - name: Ensure user systemd manager is active
+      systemd:
+        name: "user@1000.service"
+        state: started
+
+    # ── Phase 5: Systemd User Service ──────────────────────────
+    - name: Ensure user systemd directory exists
+      file:
+        path: "/home/{{ devbox_user }}/.config/systemd/user"
+        state: directory
+        owner: "{{ devbox_user }}"
+        group: "{{ devbox_user }}"
+        mode: '0755'
+
+    - name: Deploy OpenChamber systemd user unit
+      copy:
+        dest: "/home/{{ devbox_user }}/.config/systemd/user/openchamber.service"
+        owner: "{{ devbox_user }}"
+        group: "{{ devbox_user }}"
+        content: |
+          [Unit]
+          Description=OpenChamber Web UI and OpenCode Engine
+          After=network.target
+
+          [Service]
+          Type=simple
+          WorkingDirectory=/home/{{ devbox_user }}
+          Environment=HOME=/home/{{ devbox_user }}
+          Environment=NODE_ENV=production
+          Environment=NODE_OPTIONS=--max-old-space-size=2048
+          Environment=OPENCHAMBER_PORT={{ openchamber_port }}
+          Environment=OPENCHAMBER_HOST=127.0.0.1
+          Environment=OPENCHAMBER_UI_PASSWORD={{ openchamber_password }}
+          Environment=OPENCHAMBER_SYSTEMD_UNIT=openchamber.service
+          Environment=INVOCATION_ID=openchamber.service
+          Environment=PATH=/usr/local/bin:/usr/bin:/bin
+          ExecStart=/usr/local/bin/openchamber serve --foreground --host 127.0.0.1 --port {{ openchamber_port }} --ui-password {{ openchamber_password }}
+          Restart=always
+          RestartSec=3
+
+          [Install]
+          WantedBy=default.target
+
+    - name: Enable and start OpenChamber user service
+      become_user: "{{ devbox_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/1000"
+        DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus"
+      systemd:
+        name: openchamber.service
+        scope: user
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    # ── Phase 6: Caddy Reverse Proxy (Auto HTTPS via sslip.io) ──
+    - name: Install Caddy
+      apt:
+        name: caddy
+        state: present
+
+    - name: Configure Caddyfile
+      copy:
+        dest: /etc/caddy/Caddyfile
+        content: |
+          {{ domain_name }} {
+              reverse_proxy 127.0.0.1:{{ openchamber_port }} {
+                  transport http {
+                      response_header_timeout 600s
+                      dial_timeout 10s
+                  }
+              }
+          }
+      notify: Reload caddy
+
+  handlers:
+    - name: Restart zram
+      systemd:
+        name: systemd-zram-setup@zram0.service
+        state: restarted
+        daemon_reload: yes
+
+    - name: Restart journald
+      systemd:
+        name: systemd-journald
+        state: restarted
+
+    - name: Reload caddy
+      systemd:
+        name: caddy
+        state: reloaded
