@@ -1,6 +1,6 @@
 ---
 - name: Setup Lean OpenChamber + OpenCode Devbox on c7i-flex.large
-  hosts: devbox
+  hosts: all
   become: true
   vars:
     devbox_user: "ubuntu"
