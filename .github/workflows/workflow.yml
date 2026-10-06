@@ -25,6 +25,35 @@ jobs:
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      # ── 1b. Ensure S3 State Bucket & EC2 Key Pair Exist ──
+      - name: Ensure S3 State Bucket and Key Pair
+        run: |
+          BUCKET="terraformansiblecicd"
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            echo "Creating S3 bucket $BUCKET in ap-south-1..."
+            aws s3api create-bucket \
+              --bucket "$BUCKET" \
+              --region ap-south-1 \
+              --create-bucket-configuration LocationConstraint=ap-south-1
+            aws s3api put-bucket-versioning \
+              --bucket "$BUCKET" \
+              --versioning-configuration Status=Enabled
+          fi
+
+          if ! aws ec2 describe-key-pairs --key-names devbox-key --region ap-south-1 2>/dev/null; then
+            echo "Importing EC2 key pair devbox-key..."
+            echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/temp_key
+            chmod 600 /tmp/temp_key
+            ssh-keygen -y -f /tmp/temp_key > /tmp/temp_key.pub
+            aws ec2 import-key-pair \
+              --key-name devbox-key \
+              --public-key-material "fileb:///tmp/temp_key.pub" \
+              --region ap-south-1
+            rm -f /tmp/temp_key /tmp/temp_key.pub
+          fi
 
       # ── 2. Run Terraform (c7i-flex.large on ap-south-1) ──
       - name: Terraform Apply
@@ -42,7 +71,8 @@ jobs:
           until nc -z -v -w5 ${{ steps.tf.outputs.EC2_IP }} 22; do
             sleep 5
           done
-          echo "SSH daemon is reachable!"
+          echo "SSH port reachable. Waiting 10s for sshd..."
+          sleep 10
 
       # ── 4. Setup SSH Key for Ansible ──
       - name: Setup SSH Key
